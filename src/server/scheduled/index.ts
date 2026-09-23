@@ -6,7 +6,10 @@ import { expireStoreOrders } from "#/features/shop-orders/server/expiration";
 import { publishPendingRefunds } from "#/features/shop-payments/server/refunds";
 import { publishPendingSupplierOrders } from "#/features/suppliers/server/outbox";
 import { runTelegramMaintenance } from "#/features/telegram/server/maintenance";
-import { runMaintenance } from "#/server/scheduled/maintenance";
+import {
+	runMaintenance,
+	scheduledWorkScope,
+} from "#/server/scheduled/maintenance";
 
 export { runMaintenance };
 
@@ -25,38 +28,46 @@ export async function runScheduledCommerceWork(
 	cron: string,
 	scheduledAt: number,
 ) {
-	const publishBatchSize = await loadPublishBatchSize(env.DB);
-	const expired = await expireStoreOrders(env.DB, scheduledAt);
-	const deliveries = await publishPendingDeliveries(
-		env.DB,
-		env.COMMERCE_QUEUE,
-		publishBatchSize,
-	);
-	const suppliers = await publishPendingSupplierOrders(
-		env.DB,
-		env.COMMERCE_QUEUE,
-		publishBatchSize,
-	);
-	const builds = await publishPendingBuilds(
-		env.DB,
-		env.COMMERCE_QUEUE,
-		publishBatchSize,
-	);
-	const refunds = await publishPendingRefunds(
-		env.DB,
-		env.COMMERCE_QUEUE,
-		publishBatchSize,
-	);
-	const notificationEvents = await fanOutPendingCommerceNotifications(
-		env.DB,
-		publishBatchSize,
-	);
-	const notifications = await publishPendingNotifications(
-		env.DB,
-		env.COMMERCE_QUEUE,
-		publishBatchSize,
-	);
-	const telegram = await runTelegramMaintenance(env.DB, scheduledAt);
+	const scope = scheduledWorkScope(cron);
+	const recovery = scope !== "heavy";
+	const heavy = scope !== "recovery";
+	const publishBatchSize = recovery ? await loadPublishBatchSize(env.DB) : 0;
+	const expired = recovery
+		? await expireStoreOrders(env.DB, scheduledAt)
+		: { scanned: 0, expired: 0 };
+	const deliveries = recovery
+		? await publishPendingDeliveries(
+				env.DB,
+				env.COMMERCE_QUEUE,
+				publishBatchSize,
+			)
+		: { published: 0 };
+	const suppliers = recovery
+		? await publishPendingSupplierOrders(
+				env.DB,
+				env.COMMERCE_QUEUE,
+				publishBatchSize,
+			)
+		: { published: 0 };
+	const builds = recovery
+		? await publishPendingBuilds(env.DB, env.COMMERCE_QUEUE, publishBatchSize)
+		: { published: 0 };
+	const refunds = recovery
+		? await publishPendingRefunds(env.DB, env.COMMERCE_QUEUE, publishBatchSize)
+		: { published: 0 };
+	const notificationEvents = recovery
+		? await fanOutPendingCommerceNotifications(env.DB, publishBatchSize)
+		: { processed: 0, deliveries: 0 };
+	const notifications = recovery
+		? await publishPendingNotifications(
+				env.DB,
+				env.COMMERCE_QUEUE,
+				publishBatchSize,
+			)
+		: { published: 0 };
+	const telegram = heavy
+		? await runTelegramMaintenance(env.DB, scheduledAt)
+		: { skipped: true };
 	const maintenance = await runMaintenance(env, cron, undefined, scheduledAt);
 	return {
 		expired,

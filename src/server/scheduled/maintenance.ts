@@ -5,43 +5,95 @@ import { loadOperationalSettings } from "#/server/operational-settings";
 import { loadRuntimeConfig } from "#/server/runtime-config";
 import { progressivelyReencryptSecrets } from "#/server/scheduled/secret-rotation";
 
+export function scheduledWorkScope(
+	cron: string,
+): "recovery" | "heavy" | "full" {
+	if (cron === "*/5 * * * *") return "recovery";
+	if (cron === "0 * * * *") return "heavy";
+	return "full";
+}
+
+const idleSupplier = {
+	balancesUpdated: 0,
+	balancesFailed: 0,
+	catalogsUpdated: 0,
+	catalogsSkipped: 0,
+	catalogsFailed: 0,
+};
+
 export async function runMaintenance(
 	env: Env,
-	_cron: string,
+	cron: string,
 	_dependencies?: unknown,
 	now = Date.now(),
 ) {
-	const [
-		entitlements,
-		builds,
-		notifications,
-		outbox,
-		entitlementSevenDayReminders,
-		entitlementOneDayReminders,
-		expiredCarts,
-		expiredCommerceEvents,
-		expiredReplayReceipts,
-		authVerifications,
-		expiredRateLimits,
-	] = await env.DB.batch([
-		env.DB.prepare(
-			`UPDATE customer_entitlements SET status = 'expired', updated_at = ?
+	const scope = scheduledWorkScope(cron);
+	const runRecovery = scope !== "heavy";
+	const runHeavy = scope !== "recovery";
+	const zero = { meta: { changes: 0 } } as D1Result<unknown>;
+	let entitlements: D1Result<unknown> | undefined = zero;
+	let builds: D1Result<unknown> | undefined = zero;
+	let notifications: D1Result<unknown> | undefined = zero;
+	let outbox: D1Result<unknown> | undefined = zero;
+	let entitlementSevenDayReminders: D1Result<unknown> | undefined = zero;
+	let entitlementOneDayReminders: D1Result<unknown> | undefined = zero;
+	let expiredCarts: D1Result<unknown> | undefined = zero;
+	let expiredCommerceEvents: D1Result<unknown> | undefined = zero;
+	let expiredReplayReceipts: D1Result<unknown> | undefined = zero;
+	let authVerifications: D1Result<unknown> | undefined = zero;
+	let expiredRateLimits: D1Result<unknown> | undefined = zero;
+	if (runRecovery) {
+		[
+			entitlements,
+			builds,
+			notifications,
+			outbox,
+			expiredCarts,
+			authVerifications,
+			expiredRateLimits,
+		] = await env.DB.batch([
+			env.DB.prepare(
+				`UPDATE customer_entitlements SET status = 'expired', updated_at = ?
 			 WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at <= ?`,
-		).bind(now, now),
-		env.DB.prepare(
-			`UPDATE automation_jobs SET status = 'expired', completed_at = ?, updated_at = ?
+			).bind(now, now),
+			env.DB.prepare(
+				`UPDATE automation_jobs SET status = 'expired', completed_at = ?, updated_at = ?
 			 WHERE status IN ('queued','dispatching','running') AND timeout_at <= ?`,
-		).bind(now, now, now),
-		env.DB.prepare(
-			`UPDATE notification_deliveries SET status = 'pending', next_attempt_at = ?,
+			).bind(now, now, now),
+			env.DB.prepare(
+				`UPDATE notification_deliveries SET status = 'pending', next_attempt_at = ?,
 			 updated_at = ? WHERE status = 'sending' AND updated_at <= ?`,
-		).bind(now, now, now - 300_000),
-		env.DB.prepare(
-			`UPDATE outbox_events SET status = 'pending', next_attempt_at = ?, updated_at = ?
+			).bind(now, now, now - 300_000),
+			env.DB.prepare(
+				`UPDATE outbox_events SET status = 'pending', next_attempt_at = ?, updated_at = ?
 			 WHERE status = 'processing' AND updated_at <= ?`,
-		).bind(now, now, now - 300_000),
-		env.DB.prepare(
-			`INSERT INTO outbox_events
+			).bind(now, now, now - 300_000),
+			env.DB.prepare(
+				`DELETE FROM shopping_carts WHERE id IN (
+			 SELECT id FROM shopping_carts WHERE expires_at <= ?
+			 ORDER BY expires_at, id LIMIT 200)`,
+			).bind(now),
+			env.DB.prepare(
+				`DELETE FROM verifications WHERE id IN (
+			 SELECT id FROM verifications WHERE expires_at <= ?
+			 ORDER BY expires_at, id LIMIT 500)`,
+			).bind(now),
+			env.DB.prepare(
+				`DELETE FROM rate_limit_counters WHERE id IN (
+			 SELECT id FROM rate_limit_counters INDEXED BY rate_limit_counters_expiry_idx
+			 WHERE expires_at <= ? ORDER BY expires_at, id LIMIT 500)`,
+			).bind(now),
+		]);
+	}
+	if (runHeavy) {
+		[
+			entitlementSevenDayReminders,
+			entitlementOneDayReminders,
+			expiredCommerceEvents,
+			expiredReplayReceipts,
+		] = await env.DB.batch([
+			env.DB.prepare(
+				`INSERT INTO outbox_events
 			 (id, event_type, aggregate_type, aggregate_id, idempotency_key, payload,
 			  status, attempt_count, created_at, updated_at)
 			 SELECT lower(hex(randomblob(16))), 'entitlement.expiring', 'customer_entitlement',
@@ -52,9 +104,9 @@ export async function runMaintenance(
 			 AND NOT EXISTS (SELECT 1 FROM outbox_events oe
 			  WHERE oe.idempotency_key = 'entitlement-expiring-7d:' || ce.id)
 			 LIMIT 200`,
-		).bind(now, now, now + 86_400_000, now + 7 * 86_400_000),
-		env.DB.prepare(
-			`INSERT INTO outbox_events
+			).bind(now, now, now + 86_400_000, now + 7 * 86_400_000),
+			env.DB.prepare(
+				`INSERT INTO outbox_events
 			 (id, event_type, aggregate_type, aggregate_id, idempotency_key, payload,
 			  status, attempt_count, created_at, updated_at)
 			 SELECT lower(hex(randomblob(16))), 'entitlement.expiring', 'customer_entitlement',
@@ -65,60 +117,52 @@ export async function runMaintenance(
 			 AND NOT EXISTS (SELECT 1 FROM outbox_events oe
 			  WHERE oe.idempotency_key = 'entitlement-expiring-1d:' || ce.id)
 			 LIMIT 200`,
-		).bind(now, now, now, now + 86_400_000),
-		env.DB.prepare(
-			`DELETE FROM shopping_carts WHERE id IN (
-			 SELECT id FROM shopping_carts WHERE expires_at <= ?
-			 ORDER BY expires_at, id LIMIT 200)`,
-		).bind(now),
-		env.DB.prepare(
-			`DELETE FROM commerce_events WHERE id IN (
+			).bind(now, now, now, now + 86_400_000),
+			env.DB.prepare(
+				`DELETE FROM commerce_events WHERE id IN (
 			 SELECT id FROM commerce_events WHERE created_at <= ?
 			 ORDER BY created_at, id LIMIT 500)`,
-		).bind(now - 90 * 86_400_000),
-		env.DB.prepare(
-			`DELETE FROM replay_receipts WHERE id IN (
+			).bind(now - 90 * 86_400_000),
+			env.DB.prepare(
+				`DELETE FROM replay_receipts WHERE id IN (
 			 SELECT id FROM replay_receipts INDEXED BY replay_receipts_status_created_idx
 			 WHERE status IN ('processed', 'rejected', 'failed') AND created_at <= ?
 			 ORDER BY status, created_at, id LIMIT 500)`,
-		).bind(now - 90 * 86_400_000),
-		env.DB.prepare(
-			`DELETE FROM verifications WHERE id IN (
-			 SELECT id FROM verifications WHERE expires_at <= ?
-			 ORDER BY expires_at, id LIMIT 500)`,
-		).bind(now),
-		env.DB.prepare(
-			`DELETE FROM rate_limit_counters WHERE id IN (
-			 SELECT id FROM rate_limit_counters INDEXED BY rate_limit_counters_expiry_idx
-			 WHERE expires_at <= ? ORDER BY expires_at, id LIMIT 500)`,
-		).bind(now),
-	]);
-	const artifacts = await cleanupExpiredArtifacts(env.DB, env.FILES, now);
-	const runtime = await loadRuntimeConfig(env.DB);
-	const exchangeRates = await syncExchangeRatesIfDue(
-		env.DB,
-		runtime.dataEncryptionSecret,
-		fetch,
-		now,
-	);
-	const suppliers = await runSupplierMaintenance({
-		db: env.DB,
-		cache: env.CACHE,
-		runtime,
-		now,
-	});
-	const secretsReencrypted = await progressivelyReencryptSecrets(
-		env.DB,
-		runtime,
-	);
-	const settings = await loadOperationalSettings(env.DB);
-	const retention = await runOperationalRetentionCleanup({
-		db: env.DB,
-		bucket: env.FILES,
-		now,
-		retentionMs: settings.retentionAuditMs,
-	});
-	await env.DB.prepare("PRAGMA optimize").run();
+			).bind(now - 90 * 86_400_000),
+		]);
+	}
+	const artifacts = runRecovery
+		? await cleanupExpiredArtifacts(env.DB, env.FILES, now)
+		: 0;
+	let exchangeRates: { updated?: number; failed?: number } | null = null;
+	let suppliers = idleSupplier;
+	let secretsReencrypted = 0;
+	let retentionRows = 0;
+	if (runHeavy) {
+		const runtime = await loadRuntimeConfig(env.DB);
+		exchangeRates = await syncExchangeRatesIfDue(
+			env.DB,
+			runtime.dataEncryptionSecret,
+			fetch,
+			now,
+		);
+		suppliers = await runSupplierMaintenance({
+			db: env.DB,
+			cache: env.CACHE,
+			runtime,
+			now,
+		});
+		secretsReencrypted = await progressivelyReencryptSecrets(env.DB, runtime);
+		const settings = await loadOperationalSettings(env.DB);
+		const retention = await runOperationalRetentionCleanup({
+			db: env.DB,
+			bucket: env.FILES,
+			now,
+			retentionMs: settings.retentionAuditMs,
+		});
+		retentionRows = retention.affectedRows;
+		await env.DB.prepare("PRAGMA optimize").run();
+	}
 	return {
 		entitlementsExpired: changes(entitlements),
 		buildsExpired: changes(builds),
@@ -141,7 +185,7 @@ export async function runMaintenance(
 		supplierCatalogsSkipped: suppliers.catalogsSkipped,
 		supplierCatalogsFailed: suppliers.catalogsFailed,
 		secretsReencrypted,
-		retentionRows: retention.affectedRows,
+		retentionRows,
 	};
 }
 

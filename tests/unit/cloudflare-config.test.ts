@@ -140,7 +140,7 @@ if (tool === "vite" && process.env.WORKERS_CI === "1") {
 				dead_letter_queue: "gmshop-edge-commerce-dlq",
 			},
 		]);
-		expect(config.triggers?.crons).toEqual(["* * * * *"]);
+		expect(config.triggers?.crons).toEqual(["*/5 * * * *", "0 * * * *"]);
 	});
 
 	it("keeps deployment commands direct", async () => {
